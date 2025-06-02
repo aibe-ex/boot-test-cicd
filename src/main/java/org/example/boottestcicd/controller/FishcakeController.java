@@ -19,6 +19,7 @@ public class FishcakeController {
         return ResponseEntity.ok(fishcakes);
     }
 
-    public record Fishcake(String shape) {
+//    public record Fishcake(String shape) {
+    public record Fishcake(String name) {
     }
 }
