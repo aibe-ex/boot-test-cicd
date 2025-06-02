@@ -1,11 +1,10 @@
 # ---------------------------------------------------------------------------
-# GitHub Actions: Docker Image CI with Layer & Gradle Caching (Optimised)
+# GitHub Actions: Docker Image CI + Gradle & Docker Layer Caching + Prod 배포
 # 목적
-#   1. main 브랜치 push 시 → 테스트 → Docker 이미지 빌드 → GHCR 푸시
-#   2. 빌드 속도 향상
-#        • Gradle 캐시 (read‑only)
-#        • Docker Layer 캐싱 (브랜치 키)
+#   1. main 브랜치 push 시 ➜ 테스트 → Docker 이미지 빌드 → GHCR 푸시
+#   2. Gradle 캐시(읽기 전용)·Docker Layer 캐시로 빌드 시간 단축
 #   3. 결과를 Slack Webhook 으로 통보
+#   4. 빌드 성공 후 원격 서버(SSH) 재배포
 # ---------------------------------------------------------------------------
 
 name: Docker Image CI with Layer Caching
@@ -15,6 +14,9 @@ on:
     branches: [ main ]
 
 jobs:
+  # -------------------------------------------------------------------------
+  # 1) 테스트 및 이미지 빌드·푸시
+  # -------------------------------------------------------------------------
   build-and-push:
     runs-on: ubuntu-latest
 
@@ -23,32 +25,37 @@ jobs:
       packages: write  # GHCR 푸시
 
     steps:
-      # 1) 코드 체크아웃 ------------------------------------------------------
+      # 1. 코드 체크아웃 ------------------------------------------------------
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2) JDK 17 설치 --------------------------------------------------------
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
-        with:
-          distribution: temurin
-          java-version: 17
-
-      # 3) Gradle 환경 + read‑only 캐시 --------------------------------------
-      - name: Setup Gradle (read‑only cache)
+      # 2. Java 17 + Gradle 환경 설정 ----------------------------------------
+      - name: Set up Java 17 & Gradle
         uses: gradle/actions/setup-gradle@v3
         with:
-          cache-read-only: true     # post‑job 캐시 업로드 제거
+          java-version: 17
+          distribution: temurin
+          cache-read-only: true   # post-job 업로드 생략 → 대기 시간 0
 
-      # 4) 테스트 실행 --------------------------------------------------------
+      # 3. 변동 적은 Gradle 캐시 복원 ---------------------------------------
+      - name: Restore Gradle wrapper & modules cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/wrapper
+            ~/.gradle/caches/modules-*/files-*/*
+          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
+          restore-keys: |
+            ${{ runner.os }}-gradle-
+      # 4. 단위 테스트 -------------------------------------------------------
       - name: Run unit tests
         run: ./gradlew --no-daemon --build-cache --parallel test
 
-      # 5) Docker Buildx ------------------------------------------------------
+      # 5. Docker Buildx 준비 ----------------------------------------------
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # 6) GHCR 로그인 --------------------------------------------------------
+      # 6. GHCR 로그인 -------------------------------------------------------
       - name: Log in to GitHub Container Registry
         uses: docker/login-action@v3
         with:
@@ -56,23 +63,22 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # 7) Docker 메타데이터 --------------------------------------------------
+      # 7. Docker 메타데이터 -------------------------------------------------
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
         with:
           images: ghcr.io/${{ github.repository }}
 
-      # 8) Docker 레이어 캐시 -------------------------------------------------
+      # 8. Docker 레이어 캐시 ------------------------------------------------
       - name: Cache Docker layers
         uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.ref_name }}   # 브랜치 단위 키
+          key: ${{ runner.os }}-buildx-${{ github.ref_name }}   # 브랜치 단위
           restore-keys: |
             ${{ runner.os }}-buildx-
-
-      # 9) Docker 이미지 빌드 & 푸시 ------------------------------------------
+      # 9. 이미지 빌드 & 푸시 ------------------------------------------------
       - name: Build and push Docker image
         uses: docker/build-push-action@v6
         with:
@@ -84,7 +90,7 @@ jobs:
           cache-from: type=local,src=/tmp/.buildx-cache
           cache-to:   type=local,dest=/tmp/.buildx-cache,mode=max
 
-      # 10) Slack 알림 ---------------------------------------------------------
+      # 10. Slack 알림 --------------------------------------------------------
       - name: Send Slack Notification
         if: always()
         uses: act10ns/slack@v2.1.0
@@ -101,3 +107,34 @@ jobs:
             • *Status:* `${{ job.status }}`
             • *Logs:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>
             • *Image Tags:* `${{ steps.meta.outputs.tags }}`
+  # -------------------------------------------------------------------------
+  # 2) 프로덕션 서버 재배포 (SSH)
+  #    - build-and-push 완료 후 실행
+  #    - main 브랜치에서만 동작
+  # -------------------------------------------------------------------------
+  deploy-prod:
+    needs: build-and-push          # 이미지 푸시 성공 시에만
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      # 원격 서버에 SSH 접속 후 컨테이너 교체 -------------------------------
+      - name: Remote redeploy via SSH
+        uses: appleboy/ssh-action@v1.0.0
+        with:
+          host: ${{ secrets.SSH_HOST }}          # 예) 203.0.113.10
+          username: ${{ secrets.SSH_USER }}      # 예) ubuntu
+          key: ${{ secrets.SSH_PRIVATE_KEY }}    # PEM 전체 문자열
+          script: |
+            set -e
+            IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
+            echo "Logging in to GHCR..."
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+            docker pull $IMAGE
+            echo "Stopping and removing old container..."
+            docker rm -f app || true
+            echo "Starting new container..."
+            docker run -d --name app \
+              -p 80:8080 \
+              --restart unless-stopped \
+              $IMAGE
