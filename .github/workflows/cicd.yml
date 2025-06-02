@@ -1,140 +1,186 @@
-# ---------------------------------------------------------------------------
-# GitHub Actions: Docker Image CI + Gradle & Docker Layer Caching + Prod 배포
+# ------------------------------------------------------------------------------
+# GitHub Actions ┃ Docker Image CI · Gradle & Docker-Layer Caching · Prod 배포
+# ------------------------------------------------------------------------------
 # 목적
-#   1. main 브랜치 push 시 ➜ 테스트 → Docker 이미지 빌드 → GHCR 푸시
-#   2. Gradle 캐시(읽기 전용)·Docker Layer 캐시로 빌드 시간 단축
-#   3. 결과를 Slack Webhook 으로 통보
-#   4. 빌드 성공 후 원격 서버(SSH) 재배포
-# ---------------------------------------------------------------------------
+#   1. main 브랜치 push → 테스트 → Docker 이미지 빌드 → GHCR 푸시
+#   2. Gradle 읽기 전용 캐시 + Docker Layer 캐시로 빌드 시간 단축
+#   3. 빌드·배포 결과를 Slack Webhook 통보
+#   4. 빌드 성공 시 EC2(SSH) 무중단 재배포
+# AWS 준비
+#   • EC2에 Docker 설치, 보안그룹 22/80(443) 개방
+#   • 키페어(PEM) 생성 후 GitHub Secret SSH_PRIVATE_KEY 등록
+#   • SSH_USER(ec2-user/ubuntu), SSH_HOST(퍼블릭 IP), SLACK_WEBHOOK_URL 추가
+# ------------------------------------------------------------------------------
 
-name: Docker Image CI with Layer Caching
+name: docker-image-ci                # 워크플로 이름 정의
 
-on:
-  push:
-    branches: [ main ]
+on:                                   # 트리거 조건 설정
+  push:                               # git push 이벤트 감지
+    branches: [ main ]               # main 브랜치 푸시만 반응
 
-jobs:
-  # -------------------------------------------------------------------------
-  # 1) 테스트 및 이미지 빌드·푸시
-  # -------------------------------------------------------------------------
-  build-and-push:
-    runs-on: ubuntu-latest
+env:                                   # 전체 워크플로 환경변수
+  REGISTRY: ghcr.io                  # GitHub Container Registry 주소
+  IMAGE_NAME: ${{ github.repository }} # 이미지명 = 레포지토리명
 
-    permissions:
-      contents: read   # 소스 읽기
-      packages: write  # GHCR 푸시
+concurrency:                           # 동시 실행 제어 설정
+  group: ci-${{ github.ref }}        # 브랜치별 그룹핑
+  cancel-in-progress: true           # 새 실행 시 기존 실행 취소
 
-    steps:
-      # 1. 코드 체크아웃 ------------------------------------------------------
-      - name: Checkout repository
-        uses: actions/checkout@v4
+jobs:                                  # 잡 정의 시작
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 1) Build · Test · Push 잡
+  # ──────────────────────────────────────────────────────────────────────────────
+  build-and-push:                      # 빌드/푸시 잡 ID
+    runs-on: ubuntu-latest           # Ubuntu 최신 러너 사용
+    permissions:                      # 필요한 권한 설정
+      contents: read                # 소스코드 읽기 권한
+      packages: write               # 패키지 레지스트리 쓰기 권한
 
-      # 2. Java 17 + Gradle 환경 설정 ----------------------------------------
-      - name: Set up Java 17 & Gradle
-        uses: gradle/actions/setup-gradle@v3
+    steps:                             # 실행 단계 정의
+      - name: Checkout code             # 소스코드 체크아웃
+        uses: actions/checkout@v4      # 최신 체크아웃 액션 사용
+
+      - name: Set up JDK 17            # Java 17 설치
+        uses: actions/setup-java@v4    # Java 설정 액션 사용
         with:
-          java-version: 17
-          distribution: temurin
-          cache-read-only: true   # post-job 업로드 생략 → 대기 시간 0
+          distribution: temurin       # Eclipse Temurin 배포판
+          java-version: 17            # JDK 버전 17 지정
+          cache: gradle               # Gradle 의존성 캐시 활성화
 
-      # 3. 변동 적은 Gradle 캐시 복원 ---------------------------------------
-      - name: Restore Gradle wrapper & modules cache
-        uses: actions/cache@v4
+      - name: Setup Gradle             # Gradle 설정
+        uses: gradle/actions/setup-gradle@v3 # Gradle 액션 사용
         with:
-          path: |
-            ~/.gradle/wrapper
-            ~/.gradle/caches/modules-*/files-*/*
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle-
-      # 4. 단위 테스트 -------------------------------------------------------
-      - name: Run unit tests
-        run: ./gradlew --no-daemon --build-cache --parallel test
+          cache-read-only: true        # 읽기 전용 캐시 (CI에서 권장)
 
-      # 5. Docker Buildx 준비 ----------------------------------------------
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+      - name: Make gradlew executable  # gradlew 실행 권한 부여
+        run: chmod +x ./gradlew        # Linux 실행 권한 설정
 
-      # 6. GHCR 로그인 -------------------------------------------------------
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Run unit tests           # 단위 테스트 실행
+        run: ./gradlew --no-daemon --build-cache --parallel test # 병렬 테스트 실행
 
-      # 7. Docker 메타데이터 -------------------------------------------------
-      - name: Extract Docker metadata
-        id: meta
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
+      - name: Set up Docker Buildx     # Docker Buildx 설정
+        uses: docker/setup-buildx-action@v3 # 멀티플랫폼 빌드 지원
 
-      # 8. Docker 레이어 캐시 ------------------------------------------------
-      - name: Cache Docker layers
-        uses: actions/cache@v4
+      - name: Log in to GHCR           # GitHub Container Registry 로그인
+        uses: docker/login-action@v3   # Docker 로그인 액션
         with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.ref_name }}   # 브랜치 단위
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-      # 9. 이미지 빌드 & 푸시 ------------------------------------------------
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ${{ steps.meta.outputs.tags }}
-          labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=local,src=/tmp/.buildx-cache
-          cache-to:   type=local,dest=/tmp/.buildx-cache,mode=max
+          registry: ${{ env.REGISTRY }} # GHCR 주소
+          username: ${{ github.actor }} # GitHub 사용자명
+          password: ${{ secrets.GITHUB_TOKEN }} # GitHub 자동 토큰
 
-      # 10. Slack 알림 --------------------------------------------------------
-      - name: Send Slack Notification
-        if: always()
-        uses: act10ns/slack@v2.1.0
+      - name: Extract Docker metadata  # Docker 메타데이터 추출
+        id: meta                       # 다음 단계에서 참조할 ID
+        uses: docker/metadata-action@v5 # 태그/라벨 자동 생성
         with:
-          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }}
-          status: ${{ job.status }}
-          message: |
-            *GitHub Actions Workflow Status*
-            • *Repo:* `${{ github.repository }}`
-            • *Branch:* `${{ github.ref_name }}`
-            • *Commit:* `${{ github.sha }}`
-            • *Workflow:* `${{ github.workflow }}`
-            • *Run ID:* `${{ github.run_id }}`
+          images: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }} # 이미지 전체 경로
+
+      - name: Build & push image       # Docker 이미지 빌드 및 푸시
+        uses: docker/build-push-action@v6 # 빌드 푸시 액션
+        with:
+          context: .                   # 빌드 컨텍스트 경로
+          file: ./Dockerfile           # Dockerfile 위치
+          push: true                   # 레지스트리에 푸시 여부
+          tags: ${{ steps.meta.outputs.tags }}   # 생성된 태그 적용
+          labels: ${{ steps.meta.outputs.labels }} # 생성된 라벨 적용
+          cache-from: type=gha         # GitHub Actions 캐시에서 읽기
+          cache-to: type=gha,mode=max  # GitHub Actions 캐시에 저장
+
+      - name: Slack notify (CI)        # CI 결과 Slack 알림
+        if: always()                   # 성공/실패 관계없이 실행
+        uses: act10ns/slack@v2.1.0     # Slack 알림 액션
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }} # Slack Webhook URL
+          status: ${{ job.status }}    # 잡 실행 상태
+          message: |                   # 알림 메시지 내용
+            *CI Build* `${{ github.repository }}`
             • *Status:* `${{ job.status }}`
-            • *Logs:* <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Details>
-            • *Image Tags:* `${{ steps.meta.outputs.tags }}`
-  # -------------------------------------------------------------------------
-  # 2) 프로덕션 서버 재배포 (SSH)
-  #    - build-and-push 완료 후 실행
-  #    - main 브랜치에서만 동작
-  # -------------------------------------------------------------------------
-  deploy-prod:
-    needs: build-and-push          # 이미지 푸시 성공 시에만
-    runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main'
+            • *Branch:* `${{ github.ref_name }}`  *Commit:* `${{ github.sha }}`
+            • *Image:* `${{ steps.meta.outputs.tags }}`
+            • <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Logs>
 
-    steps:
-      # 원격 서버에 SSH 접속 후 컨테이너 교체 -------------------------------
-      - name: Remote redeploy via SSH
-        uses: appleboy/ssh-action@v1.0.0
+  # ──────────────────────────────────────────────────────────────────────────────
+  # 2) Production Deploy (SSH)
+  # ──────────────────────────────────────────────────────────────────────────────
+  deploy-prod:                        # 프로덕션 배포 잡 ID
+    needs: build-and-push           # 빌드 잡 성공 후 실행
+    runs-on: ubuntu-latest          # Ubuntu 최신 러너 사용
+    if: github.ref == 'refs/heads/main' # main 브랜치일 때만 실행
+
+    steps:                           # 배포 단계
+      - name: Redeploy via SSH        # SSH로 서버 재배포
+        uses: appleboy/ssh-action@v1.0.3 # SSH 접속 액션
         with:
-          host: ${{ secrets.SSH_HOST }}          # 예) 203.0.113.10
-          username: ${{ secrets.SSH_USER }}      # 예) ubuntu
-          key: ${{ secrets.SSH_PRIVATE_KEY }}    # PEM 전체 문자열
-          script: |
-            set -e
-            IMAGE=ghcr.io/${{ github.repository }}/app:${{ github.sha }}
-            echo "Logging in to GHCR..."
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker pull $IMAGE
-            echo "Stopping and removing old container..."
-            docker rm -f app || true
-            echo "Starting new container..."
-            docker run -d --name app \
-              -p 80:8080 \
-              --restart unless-stopped \
-              $IMAGE
+          host: ${{ secrets.SSH_HOST }}   # 대상 서버 호스트
+          username: ${{ secrets.SSH_USER }} # SSH 사용자명
+          key: ${{ secrets.SSH_PRIVATE_KEY }} # SSH 개인키
+          script: |                    # 원격 서버에서 실행할 스크립트
+            set -e                     # 오류 발생 시 스크립트 중단
+            IMAGE=${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main # 배포할 이미지
+            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ${{ env.REGISTRY }} -u ${{ github.actor }} --password-stdin # GHCR 로그인
+            docker pull $IMAGE         # 새 이미지 다운로드
+            docker rm -f app || true   # 기존 컨테이너 강제 제거
+            docker run -d --name app -p 80:8080 --restart unless-stopped $IMAGE # 새 컨테이너 실행
+
+      - name: Slack notify (deploy)    # 배포 결과 Slack 알림
+        if: always()                   # 성공/실패 관계없이 실행
+        uses: act10ns/slack@v2.1.0     # Slack 알림 액션
+        with:
+          webhook-url: ${{ secrets.SLACK_WEBHOOK_URL }} # Slack Webhook URL
+          status: ${{ job.status }}    # 배포 잡 실행 상태
+          message: |                   # 배포 알림 메시지
+            *Prod Deploy* `${{ github.repository }}`
+            • *Status:* `${{ job.status }}`
+            • *Server:* `${{ secrets.SSH_HOST }}`
+            • *Image:* `${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:main`
+            • <${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|Logs>
+
+# ──────────────────────────────────────────────────────────────────────────────
+# 워크플로 실행 절차 시각화
+# ──────────────────────────────────────────────────────────────────────────────
+#
+# 📋 CI/CD 파이프라인 흐름도
+#
+# ┌─────────────────┐
+# │   Git Push      │ ← Developer pushes to main branch
+# │   (main)        │
+# └─────────┬───────┘
+#           │
+#           ▼
+# ┌─────────────────┐
+# │  🔧 BUILD JOB   │
+# │                 │
+# │ 1️⃣  Checkout    │ ← Download source code
+# │ 2️⃣  Setup JDK   │ ← Install Java 17 + Gradle cache
+# │ 3️⃣  Run Tests   │ ← Execute unit tests
+# │ 4️⃣  Docker Build│ ← Build container image
+# │ 5️⃣  Push GHCR   │ ← Upload to GitHub Container Registry
+# │ 6️⃣  Slack Alert │ ← Notify build status
+# └─────────┬───────┘
+#           │
+#           ▼ (if build success)
+# ┌─────────────────┐
+# │ 🚀 DEPLOY JOB   │
+# │                 │
+# │ 1️⃣  SSH Connect │ ← Connect to EC2 server
+# │ 2️⃣  Pull Image  │ ← Download new image from GHCR
+# │ 3️⃣  Stop Old    │ ← Remove existing container
+# │ 4️⃣  Start New   │ ← Run new container (port 80→8080)
+# │ 5️⃣  Slack Alert │ ← Notify deploy status
+# └─────────────────┘
+#
+# 🔄 Parallel Processes:
+# • Gradle caching (read-only)
+# • Docker layer caching (GitHub Actions)
+# • Concurrent builds (cancelled if new push)
+#
+# 📊 Monitoring Points:
+# • Test results → Slack
+# • Build status → Slack
+# • Deploy status → Slack
+# • All logs → GitHub Actions UI
+#
+# 🛡️  Security Features:
+# • GHCR authentication via GitHub token
+# • SSH key-based server access
+# • Secrets management via GitHub
+# • Read-only Gradle cache in CI
